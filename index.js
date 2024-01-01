@@ -1,8 +1,10 @@
 "use strict";
 
-var AWS = require('aws-sdk');
 
-console.log("AWS Lambda SES Forwarder // @arithmetric // Version 5.1.0");
+import { S3Client, CopyObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { SESClient, SendRawEmailCommand } from "@aws-sdk/client-ses";
+
+console.log("AWS Lambda SES Forwarder // @arithmetric // Version 5.0.0");
 
 // Configure the S3 bucket and key prefix for stored raw emails, and the
 // mapping of email addresses to forward from and to.
@@ -58,6 +60,7 @@ var defaultConfig = {
   }
 };
 
+
 /**
  * Parses the SES event record provided for the `mail` and `receipients` data.
  *
@@ -65,7 +68,7 @@ var defaultConfig = {
  *
  * @return {object} - Promise resolved with data.
  */
-exports.parseEvent = function(data) {
+const parseEvent = function(data) {
   // Validate characteristics of a SES event record.
   if (!data.event ||
       !data.event.hasOwnProperty('Records') ||
@@ -92,7 +95,7 @@ exports.parseEvent = function(data) {
  *
  * @return {object} - Promise resolved with data.
  */
-exports.transformRecipients = function(data) {
+const transformRecipients = function(data) {
   var newRecipients = [];
   data.originalRecipients = data.recipients;
   data.recipients.forEach(function(origEmail) {
@@ -152,7 +155,7 @@ exports.transformRecipients = function(data) {
  *
  * @return {object} - Promise resolved with data.
  */
-exports.fetchMessage = function(data) {
+const fetchMessage = function(data) {
   // Copying email object to ensure read permission
   data.log({
     level: "info",
@@ -160,7 +163,7 @@ exports.fetchMessage = function(data) {
       data.config.emailKeyPrefix + data.email.messageId
   });
   return new Promise(function(resolve, reject) {
-    data.s3.copyObject({
+    data.s3.send(new CopyObjectCommand({
       Bucket: data.config.emailBucket,
       CopySource: data.config.emailBucket + '/' + data.config.emailKeyPrefix +
         data.email.messageId,
@@ -168,11 +171,11 @@ exports.fetchMessage = function(data) {
       ACL: 'private',
       ContentType: 'text/plain',
       StorageClass: 'STANDARD'
-    }, function(err) {
+    }), function(err) {
       if (err) {
         data.log({
           level: "error",
-          message: "copyObject() returned error:",
+          message: "CopyObjectCommand() returned error:",
           error: err,
           stack: err.stack
         });
@@ -181,21 +184,21 @@ exports.fetchMessage = function(data) {
       }
 
       // Load the raw email from S3
-      data.s3.getObject({
+      data.s3.send(new GetObjectCommand({
         Bucket: data.config.emailBucket,
         Key: data.config.emailKeyPrefix + data.email.messageId
-      }, function(err, result) {
+      }), async function(err, result) {
         if (err) {
           data.log({
             level: "error",
-            message: "getObject() returned error:",
+            message: "GetObjectCommand() returned error:",
             error: err,
             stack: err.stack
           });
           return reject(
             new Error("Error: Failed to load message body from S3."));
         }
-        data.emailData = result.Body.toString();
+        data.emailData = await result.Body.transformToString();
         return resolve(data);
       });
     });
@@ -210,7 +213,7 @@ exports.fetchMessage = function(data) {
  *
  * @return {object} - Promise resolved with data.
  */
-exports.processMessage = function(data) {
+const processMessage = function(data) {
   var match = data.emailData.match(/^((?:.+\r?\n)*)(\r?\n(?:.*\s+)*)/m);
   var header = match && match[1] ? match[1] : data.emailData;
   var body = match && match[2] ? match[2] : '';
@@ -262,7 +265,7 @@ exports.processMessage = function(data) {
 
   // Replace original 'To' header with a manually defined one
   if (data.config.toEmail) {
-    header = header.replace(/^to:[\t ]?(.*)/mgi, 'To: ' + data.config.toEmail);
+    header = header.replace(/^to:[\t ]?(.*)/mgi, () => 'To: ' + data.config.toEmail);
   }
 
   // Remove the Return-Path header.
@@ -291,12 +294,12 @@ exports.processMessage = function(data) {
  *
  * @return {object} - Promise resolved with data.
  */
-exports.sendMessage = function(data) {
+const sendMessage = function(data) {
   var params = {
     Destinations: data.recipients,
     Source: data.originalRecipient,
     RawMessage: {
-      Data: data.emailData
+      Data: Buffer.from(data.emailData)
     }
   };
   data.log({
@@ -306,11 +309,11 @@ exports.sendMessage = function(data) {
       data.recipients.join(", ") + "."
   });
   return new Promise(function(resolve, reject) {
-    data.ses.sendRawEmail(params, function(err, result) {
+    data.ses.send(new SendRawEmailCommand(params), function(err, result) {
       if (err) {
         data.log({
           level: "error",
-          message: "sendRawEmail() returned error.",
+          message: "SendRawEmailCommand() returned error.",
           error: err,
           stack: err.stack
         });
@@ -318,7 +321,7 @@ exports.sendMessage = function(data) {
       }
       data.log({
         level: "info",
-        message: "sendRawEmail() successful.",
+        message: "SendRawEmailCommand() successful.",
         result: result
       });
       resolve(data);
@@ -336,14 +339,14 @@ exports.sendMessage = function(data) {
  * @param {object} overrides - Overrides for the default data, including the
  * configuration, SES object, and S3 object.
  */
-exports.handler = function(event, context, callback, overrides) {
+export const handler = function(event, context, callback, overrides) {
   var steps = overrides && overrides.steps ? overrides.steps :
     [
-      exports.parseEvent,
-      exports.transformRecipients,
-      exports.fetchMessage,
-      exports.processMessage,
-      exports.sendMessage
+      parseEvent,
+      transformRecipients,
+      fetchMessage,
+      processMessage,
+      sendMessage
     ];
   var data = {
     event: event,
@@ -351,9 +354,9 @@ exports.handler = function(event, context, callback, overrides) {
     context: context,
     config: overrides && overrides.config ? overrides.config : defaultConfig,
     log: overrides && overrides.log ? overrides.log : console.log,
-    ses: overrides && overrides.ses ? overrides.ses : new AWS.SES(),
+    ses: overrides && overrides.ses ? overrides.ses : new SESClient(),
     s3: overrides && overrides.s3 ?
-      overrides.s3 : new AWS.S3({signatureVersion: 'v4'})
+      overrides.s3 : new S3Client({signatureVersion: 'v4'})
   };
   Promise.series(steps, data)
     .then(function(data) {
